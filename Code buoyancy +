@@ -1,0 +1,187 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
+#include <Adafruit_MPL3115A2.h>
+
+Servo esc;
+Adafruit_MPL3115A2 baro;
+SoftwareSerial BLE(10, 11);
+
+const char* COMPANY = "EX01";  // change to your MATE company number
+
+const int DESCEND_PWM  = 1650;  // moderate descent to save energy for ascent
+const int ASCEND_PWM   = 1100;  // maximum power to ascent
+const int NEUTRAL_PWM  = 1500;  // full stop — draws almost no current
+
+const unsigned long DESCEND_TIME = 20000;  // tune for 2.5m
+const unsigned long ASCEND_TIME  = 45000;  // 45 seconds full power up
+const unsigned long HOLD_TIME    = 30000;
+
+const int MAX_LOG = 36;
+const unsigned long LOG_INTERVAL = 5000;
+
+struct LogEntry {
+  unsigned long timestamp_ms;
+  int16_t  temperature_x10;
+  int32_t  pressure_x10;
+  int16_t  depth_x100;
+  int16_t  altitude_x10;
+  uint8_t  phase_code;
+};
+
+LogEntry dataLog[MAX_LOG];
+int logIndex = 0;
+float surfacePressure = 0;
+
+const char* phaseLabel(uint8_t code) {
+  switch(code) {
+    case 0: return "PRE_DIVE";
+    case 1: return "DESCEND";
+    case 2: return "HOLD_2.5M";
+    case 3: return "ASCEND";
+    case 4: return "HOLD_40CM";
+    default: return "UNKNOWN";
+  }
+}
+
+void both(float val, int dec) {
+  Serial.print(val, dec);
+  BLE.print(val, dec);
+}
+
+void bothLn(const __FlashStringHelper* msg) {
+  Serial.println(msg);
+  BLE.println(msg);
+}
+
+void both(const __FlashStringHelper* msg) {
+  Serial.print(msg);
+  BLE.print(msg);
+}
+
+void both(unsigned long val) {
+  Serial.print(val);
+  BLE.print(val);
+}
+
+void both(const char* val) {
+  Serial.print(val);
+  BLE.print(val);
+}
+
+void logSample(uint8_t phase_code) {
+  if (logIndex >= MAX_LOG) return;
+
+  float pressure = baro.getPressure();
+  float altitude = baro.getAltitude();
+  float temp     = baro.getTemperature();
+  float depth    = (pressure - surfacePressure) / 9810.0;
+  if (depth < 0) depth = 0;
+
+  dataLog[logIndex].timestamp_ms    = millis();
+  dataLog[logIndex].temperature_x10 = (int16_t)(temp * 10);
+  dataLog[logIndex].pressure_x10    = (int32_t)(pressure * 10);
+  dataLog[logIndex].depth_x100      = (int16_t)(depth * 100);
+  dataLog[logIndex].altitude_x10    = (int16_t)(altitude * 10);
+  dataLog[logIndex].phase_code      = phase_code;
+  logIndex++;
+
+  Serial.print(COMPANY);        Serial.print(F(" "));
+  Serial.print(millis());       Serial.print(F("ms "));
+  Serial.print(pressure, 1);    Serial.print(F("Pa "));
+  Serial.print(depth, 2);       Serial.print(F("m "));
+  Serial.print(temp, 1);        Serial.print(F("C "));
+  Serial.println(phaseLabel(phase_code));
+
+  BLE.print(COMPANY);           BLE.print(F(" "));
+  BLE.print(millis());          BLE.print(F("ms "));
+  BLE.print(pressure, 1);       BLE.print(F("Pa "));
+  BLE.print(depth, 2);          BLE.print(F("m "));
+  BLE.print(temp, 1);           BLE.print(F("C "));
+  BLE.println(phaseLabel(phase_code));
+}
+
+void runPhase(int pwm, unsigned long duration, uint8_t phase_code) {
+  esc.writeMicroseconds(pwm);
+  unsigned long start   = millis();
+  unsigned long lastLog = millis() - LOG_INTERVAL;
+
+  while (millis() - start < duration) {
+    if (millis() - lastLog >= LOG_INTERVAL) {
+      logSample(phase_code);
+      lastLog = millis();
+    }
+  }
+}
+
+void transmitLog() {
+  bothLn(F("===== MATE FLOAT DIVE LOG ====="));
+  bothLn(F("Company,Time(ms),Phase,Temp(C),Pressure(Pa),Depth(m),Alt(m)"));
+
+  for (int i = 0; i < logIndex; i++) {
+    LogEntry &e = dataLog[i];
+    both(COMPANY);              both(F(","));
+    both(e.timestamp_ms);       both(F(","));
+    both(phaseLabel(e.phase_code)); both(F(","));
+    both(e.temperature_x10 / 10.0, 1); both(F(","));
+    both(e.pressure_x10 / 10.0, 0);    both(F(","));
+    both(e.depth_x100 / 100.0, 2);     both(F(","));
+    both(e.altitude_x10 / 10.0, 1);
+    Serial.println(); BLE.println();
+    delay(50);
+  }
+
+  bothLn(F("===== END OF LOG ====="));
+  bothLn(F("TRANSMISSION COMPLETE"));
+}
+
+void setup() {
+  esc.attach(9);
+  esc.writeMicroseconds(NEUTRAL_PWM);
+  delay(2000);
+
+  Serial.begin(9600);
+  BLE.begin(9600);
+
+  if (!baro.begin()) {
+    bothLn(F("MPL3115A2 ERROR!"));
+    while (1);
+  }
+
+  surfacePressure = baro.getPressure();
+
+  bothLn(F("PRE-DIVE PACKET:"));
+  logSample(0);
+
+  bothLn(F("GO!"));
+  delay(8000);
+
+  // Profile 1 descent
+  runPhase(DESCEND_PWM, DESCEND_TIME, 1);
+}
+
+void loop() {
+  for (int cycle = 1; cycle <= 2; cycle++) {
+    Serial.print(F("=== Profile "));
+    Serial.print(cycle);
+    Serial.println(F(" of 2 ==="));
+
+    if (cycle == 1) {
+      runPhase(NEUTRAL_PWM, HOLD_TIME,   2);  // hold at 2.5m — motor off saves energy
+      runPhase(ASCEND_PWM,  ASCEND_TIME, 3);  // 45 sec full power up
+      runPhase(NEUTRAL_PWM, HOLD_TIME,   4);  // hold at 40cm — motor off saves energy
+    } else {
+      runPhase(DESCEND_PWM, DESCEND_TIME, 1);
+      runPhase(NEUTRAL_PWM, HOLD_TIME,    2);  // motor off saves energy
+      runPhase(ASCEND_PWM,  ASCEND_TIME,  3);  // 45 sec full power up
+      runPhase(NEUTRAL_PWM, HOLD_TIME,    4);  // motor off saves energy
+    }
+  }
+
+  esc.writeMicroseconds(NEUTRAL_PWM);
+  bothLn(F("MISSION COMPLETE - Awaiting recovery..."));
+  delay(5000);
+  transmitLog();
+  while (true);
+}
+
